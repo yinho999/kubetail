@@ -319,7 +319,7 @@ func TestDesktopHealthMonitor_GetHealthStatus(t *testing.T) {
 			if tt.setupMockError {
 				cm.On("GetOrCreateClientset", tt.kubeContext).Return(nil, fmt.Errorf("connection error"))
 			} else {
-				mockClientset := fake.NewSimpleClientset()
+				mockClientset := fake.NewClientset()
 				cm.On("GetOrCreateClientset", tt.kubeContext).Return(mockClientset, nil)
 			}
 
@@ -394,7 +394,7 @@ func TestInClusterHealthMonitor_GetHealthStatus(t *testing.T) {
 			if tt.setupMockError {
 				cm.On("GetOrCreateClientset", "").Return(nil, fmt.Errorf("connection error"))
 			} else {
-				mockClientset := fake.NewSimpleClientset()
+				mockClientset := fake.NewClientset()
 				cm.On("GetOrCreateClientset", "").Return(mockClientset, nil)
 			}
 
