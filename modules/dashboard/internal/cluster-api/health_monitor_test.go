@@ -17,6 +17,7 @@ package clusterapi
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,13 +33,22 @@ type MockHealthMonitorWorker struct {
 	showdownTime time.Duration
 	shutdown     atomic.Bool
 	healthStatus HealthStatus
+
+	statusMu       sync.RWMutex
+	statusWatchers map[string]chan HealthStatus
+	watcherId      atomic.Uint64
+	done           chan struct{}
+	statusTrigger  chan HealthStatus
 }
 
 func newMockHealthMonitorWorker(showdownTime time.Duration) *MockHealthMonitorWorker {
 	return &MockHealthMonitorWorker{
-		shutdown:     atomic.Bool{},
-		showdownTime: showdownTime,
-		healthStatus: HealthStatusSuccess,
+		shutdown:       atomic.Bool{},
+		showdownTime:   showdownTime,
+		healthStatus:   HealthStatusSuccess,
+		statusWatchers: make(map[string]chan HealthStatus),
+		done:           make(chan struct{}),
+		statusTrigger:  make(chan HealthStatus, 10),
 	}
 }
 
@@ -48,6 +58,7 @@ func (m *MockHealthMonitorWorker) Start(ctx context.Context) error {
 
 func (m *MockHealthMonitorWorker) Shutdown() {
 	m.shutdown.Store(true)
+	close(m.done)
 }
 
 func (m *MockHealthMonitorWorker) GetHealthStatus() HealthStatus {
@@ -55,7 +66,71 @@ func (m *MockHealthMonitorWorker) GetHealthStatus() HealthStatus {
 }
 
 func (m *MockHealthMonitorWorker) WatchHealthStatus(ctx context.Context) (<-chan HealthStatus, error) {
-	return nil, nil
+	watcherId := fmt.Sprintf("watcher-%d", m.watcherId.Add(1))
+	outCh := make(chan HealthStatus, 1)
+
+	// Register watcher
+	m.statusMu.Lock()
+	m.statusWatchers[watcherId] = outCh
+	currentStatus := m.healthStatus
+	m.statusMu.Unlock()
+
+	// Send status to the channel immediately
+	select {
+	case outCh <- currentStatus:
+	default:
+	}
+
+	go m.handleWatcher(ctx, watcherId, outCh)
+
+	return outCh, nil
+}
+
+func (m *MockHealthMonitorWorker) handleWatcher(ctx context.Context, watcherId string, outCh chan HealthStatus) {
+	// Cleanup
+	defer func() {
+		m.statusMu.Lock()
+		delete(m.statusWatchers, watcherId)
+		m.statusMu.Unlock()
+		close(outCh)
+	}()
+
+	//
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-m.done:
+			return
+
+		case newStatus := <-m.statusTrigger:
+			// Get the status from status trigger and Broadcast to the registered statusWatcher
+			m.statusMu.RLock()
+			if _, exist := m.statusWatchers[watcherId]; exist {
+				select {
+				case outCh <- newStatus:
+				// if ctx is done
+				case <-ctx.Done():
+					m.statusMu.RUnlock()
+					return
+				}
+			}
+			m.statusMu.RUnlock()
+		}
+	}
+}
+
+func (m *MockHealthMonitorWorker) TriggerHealthStatus(newStatus HealthStatus) {
+	m.statusMu.Lock()
+	m.healthStatus = newStatus
+	m.statusMu.Unlock()
+
+	// Non-blocking send to trigger channel
+	select {
+	case m.statusTrigger <- newStatus:
+	default:
+	}
 }
 
 func (m *MockHealthMonitorWorker) ReadyWait(ctx context.Context) error {
@@ -419,5 +494,261 @@ func TestInClusterHealthMonitor_GetHealthStatus(t *testing.T) {
 				assert.Equal(t, tt.expectedStatus, status)
 			}
 		})
+	}
+}
+
+// WatchHealthStatus
+
+// DesktopHealthMonitor
+func TestDesktopHealthMonitor_WatchHealthStatus(t *testing.T) {
+	tests := []struct {
+		name           string
+		kubeContext    string
+		namespace      *string
+		serviceName    *string
+		mockStatus     HealthStatus
+		setupMockError bool
+		expectedStatus HealthStatus
+		expectError    bool
+	}{
+		{
+			name:           "Successful status retrieval - SUCCESS",
+			kubeContext:    "test-context",
+			namespace:      ptr.To("test-namespace"),
+			serviceName:    ptr.To("test-service"),
+			mockStatus:     HealthStatusSuccess,
+			setupMockError: false,
+			expectedStatus: HealthStatusSuccess,
+			expectError:    false,
+		},
+		{
+			name:           "Successful status retrieval - FAILURE",
+			kubeContext:    "test-context",
+			namespace:      ptr.To("test-namespace"),
+			serviceName:    ptr.To("test-service"),
+			mockStatus:     HealthStatusFailure,
+			setupMockError: false,
+			expectedStatus: HealthStatusFailure,
+			expectError:    false,
+		},
+		{
+			name:           "Successful status retrieval - PENDING",
+			kubeContext:    "test-context",
+			namespace:      ptr.To("test-namespace"),
+			serviceName:    ptr.To("test-service"),
+			mockStatus:     HealthStatusPending,
+			setupMockError: false,
+			expectedStatus: HealthStatusPending,
+			expectError:    false,
+		},
+		{
+			name:           "Successful status retrieval - NOTFOUND",
+			kubeContext:    "test-context",
+			namespace:      ptr.To("test-namespace"),
+			serviceName:    ptr.To("test-service"),
+			mockStatus:     HealthStatusNotFound,
+			setupMockError: false,
+			expectedStatus: HealthStatusNotFound,
+			expectError:    false,
+		},
+		{
+			name:           "Worker creation error",
+			kubeContext:    "invalid-context",
+			namespace:      ptr.To("test-namespace"),
+			serviceName:    ptr.To("test-service"),
+			mockStatus:     HealthStatusUknown,
+			setupMockError: true,
+			expectedStatus: HealthStatusUknown,
+			expectError:    true,
+		},
+		{
+			name:           "Default namespace and service name",
+			kubeContext:    "test-context",
+			namespace:      nil,
+			serviceName:    nil,
+			mockStatus:     HealthStatusSuccess,
+			setupMockError: false,
+			expectedStatus: HealthStatusSuccess,
+			expectError:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup
+			cm := &k8shelpersmock.MockConnectionManager{}
+
+			if tt.setupMockError {
+				cm.On("GetOrCreateClientset", tt.kubeContext).Return(nil, fmt.Errorf("connection error"))
+			} else {
+				mockClientset := fake.NewClientset()
+				cm.On("GetOrCreateClientset", tt.kubeContext).Return(mockClientset, nil)
+			}
+
+			hm := NewDesktopHealthMonitor(cm)
+
+			var mockWorker *MockHealthMonitorWorker
+			namespace := ptr.Deref(tt.namespace, DefaultNamespace)
+			serviceName := ptr.Deref(tt.serviceName, DefaultServiceName)
+			cacheKey := fmt.Sprintf("%s::%s::%s", tt.kubeContext, namespace, serviceName)
+
+			mockWorker = newMockHealthMonitorWorker(1 * time.Second)
+			mockWorker.healthStatus = tt.mockStatus
+			hm.workerCache.Store(cacheKey, mockWorker)
+
+			// Action
+			ctx := context.Background()
+			mockWorker.TriggerHealthStatus(tt.mockStatus)
+			status, err := hm.WatchHealthStatus(ctx, tt.kubeContext, tt.namespace, tt.serviceName)
+
+			// Assert
+			assert.NoError(t, err)
+			workerStatus := <-status
+			assert.Equal(t, tt.expectedStatus, workerStatus)
+		})
+	}
+}
+
+func TestDesktopHealthMonitor_WatchHealthStatus_ContextCancellation(t *testing.T) {
+	// Setup
+	cm := &k8shelpersmock.MockConnectionManager{}
+	kubeContext := "test-context"
+	mockClientset := fake.NewClientset()
+	cm.On("GetOrCreateClientset", kubeContext).Return(mockClientset, nil)
+
+	hm := NewDesktopHealthMonitor(cm)
+	mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+	cacheKey := fmt.Sprintf("%s::%s::%s", kubeContext, DefaultNamespace, DefaultServiceName)
+	hm.workerCache.Store(cacheKey, mockWorker)
+
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Action
+	// Start watching
+	mockWorker.TriggerHealthStatus(HealthStatusSuccess)
+	statusCh, err := hm.WatchHealthStatus(ctx, kubeContext, nil, nil)
+	assert.NoError(t, err)
+
+	// Receive initial status
+	workerStatus := <-statusCh
+	assert.Equal(t, (HealthStatus)(HealthStatusSuccess), workerStatus)
+
+	// Cancel context
+	cancel()
+
+	// Wait for the channel to be closed
+	timeout := time.After(1 * time.Second)
+
+	// Verify channel is closed
+	for {
+		select {
+		case _, ok := <-statusCh:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("Channel should be closed after context cancellation")
+		}
+	}
+}
+
+// InClusterHealthMonitor
+func TestInClusterHealthMonitor_WatchHealthStatus(t *testing.T) {
+	tests := []struct {
+		name           string
+		endpoint       string
+		mockStatus     HealthStatus
+		setupMockError bool
+		expectedStatus HealthStatus
+		expectError    bool
+	}{
+		{
+			name:           "Successful status retrieval - SUCCESS",
+			endpoint:       "kubetail-cluster-api.kubetail-system.svc.cluster.local:50051",
+			mockStatus:     HealthStatusSuccess,
+			expectedStatus: HealthStatusSuccess,
+			expectError:    false,
+		},
+		{
+			name:           "Successful status retrieval - Ungrouped",
+			endpoint:       "",
+			mockStatus:     HealthStatusUknown,
+			expectedStatus: HealthStatusUknown,
+			expectError:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create mock connection manager
+			cm := &k8shelpersmock.MockConnectionManager{}
+
+			if tt.setupMockError {
+				cm.On("GetOrCreateClientset", "").Return(nil, fmt.Errorf("connection error"))
+			} else {
+				mockClientset := fake.NewClientset()
+				cm.On("GetOrCreateClientset", "").Return(mockClientset, nil)
+			}
+
+			hm := NewInClusterHealthMonitor(cm, tt.endpoint)
+			mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+			mockWorker.healthStatus = tt.mockStatus
+			hm.worker = mockWorker
+
+			// Action
+			ctx := context.Background()
+			mockWorker.TriggerHealthStatus(tt.mockStatus)
+			status, err := hm.WatchHealthStatus(ctx, "", nil, nil)
+
+			// Assert
+			assert.NoError(t, err)
+			workerStatus := <-status
+			assert.Equal(t, tt.expectedStatus, workerStatus)
+		})
+	}
+}
+
+func TestInClusterHealthMonitor_WatchHealthStatus_ContextCancellation(t *testing.T) {
+	// Setup
+	cm := &k8shelpersmock.MockConnectionManager{}
+	kubeContext := "test-context"
+	mockClientset := fake.NewClientset()
+	cm.On("GetOrCreateClientset", kubeContext).Return(mockClientset, nil)
+
+	hm := NewInClusterHealthMonitor(cm, "")
+	mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+	mockWorker.healthStatus = HealthStatusSuccess
+	hm.worker = mockWorker
+
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Action
+	// Start watching
+	mockWorker.TriggerHealthStatus(HealthStatusSuccess)
+	statusCh, err := hm.WatchHealthStatus(ctx, "", nil, nil)
+	assert.NoError(t, err)
+
+	// Receive initial status
+	workerStatus := <-statusCh
+	assert.Equal(t, (HealthStatus)(HealthStatusSuccess), workerStatus)
+
+	// Cancel context
+	cancel()
+
+	// Wait for the channel to be closed
+	timeout := time.After(1 * time.Second)
+
+	// Verify channel is closed
+	for {
+		select {
+		case _, ok := <-statusCh:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("Channel should be closed after context cancellation")
+		}
 	}
 }
