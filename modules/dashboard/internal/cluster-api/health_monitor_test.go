@@ -793,7 +793,7 @@ func TestDesktopHealthMonitor_ReadyWait_Immediate_Success(t *testing.T) {
 	// Assert
 	assert.NoError(t, err)
 }
-func TestDesktopHealthMonitor_ReadyWait_Wait_Success(t *testing.T) {
+func TestDesktopHealthMonitor_ReadyWait_WaitSuccess(t *testing.T) {
 	// Setup
 	cm := &k8shelpersmock.MockConnectionManager{}
 	kubeContext := "test-context"
@@ -820,7 +820,7 @@ func TestDesktopHealthMonitor_ReadyWait_Wait_Success(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestDesktopHealthMonitor_ReadyWait_Wait_Failure(t *testing.T) {
+func TestDesktopHealthMonitor_ReadyWait_WaitFailure(t *testing.T) {
 	// Setup
 	cm := &k8shelpersmock.MockConnectionManager{}
 	kubeContext := "test-context"
@@ -832,6 +832,69 @@ func TestDesktopHealthMonitor_ReadyWait_Wait_Failure(t *testing.T) {
 	mockWorker.healthStatus = HealthStatusPending
 	cacheKey := fmt.Sprintf("%s::%s::%s", kubeContext, DefaultNamespace, DefaultServiceName)
 	hm.workerCache.Store(cacheKey, mockWorker)
+
+	// Action
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// Call the health monitor's ReadyWait
+	err := hm.ReadyWait(ctx, kubeContext, nil, nil)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context deadline exceeded")
+}
+
+func TestInClusterHealthMonitor_ReadyWait_ImmediateSuccess(t *testing.T) {
+	// Setup
+	cm := &k8shelpersmock.MockConnectionManager{}
+	kubeContext := "test-context"
+	mockClientset := fake.NewClientset()
+	cm.On("GetOrCreateClientset", kubeContext).Return(mockClientset, nil)
+	hm := NewInClusterHealthMonitor(cm, "")
+	mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+	hm.worker = mockWorker
+
+	// Action
+	ctx := context.Background()
+	mockWorker.healthStatus = HealthStatusSuccess
+	err := hm.ReadyWait(ctx, kubeContext, nil, nil)
+
+	// Assert
+	assert.NoError(t, err)
+}
+func TestInClusterHealthMonitor_ReadyWait_WaitSuccess(t *testing.T) {
+	// Setup
+	cm := &k8shelpersmock.MockConnectionManager{}
+	kubeContext := "test-context"
+	mockClientset := fake.NewClientset()
+	cm.On("GetOrCreateClientset", kubeContext).Return(mockClientset, nil)
+	hm := NewInClusterHealthMonitor(cm, "")
+	mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+	hm.worker = mockWorker
+
+	// Action
+	ctx := context.Background()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		mockWorker.TriggerHealthStatus(HealthStatusSuccess)
+	}()
+	err := hm.ReadyWait(ctx, kubeContext, nil, nil)
+
+	// Assert
+	assert.NoError(t, err)
+}
+
+func TestInClusterHealthMonitor_ReadyWait_WaitFailure(t *testing.T) {
+	// Setup
+	cm := &k8shelpersmock.MockConnectionManager{}
+	kubeContext := "test-context"
+	mockClientset := fake.NewClientset()
+	cm.On("GetOrCreateClientset", kubeContext).Return(mockClientset, nil)
+	hm := NewInClusterHealthMonitor(cm, "")
+	mockWorker := newMockHealthMonitorWorker(1 * time.Second)
+	mockWorker.healthStatus = HealthStatusPending
+	hm.worker = mockWorker
 
 	// Action
 	ctx := context.Background()
