@@ -29,8 +29,9 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// MockHealthMonitorWorker is a mock implementation of the HealthMonitorWorker interface
 type MockHealthMonitorWorker struct {
-	showdownTime time.Duration
+	shutdownTime time.Duration
 	shutdown     atomic.Bool
 	healthStatus HealthStatus
 
@@ -44,7 +45,7 @@ type MockHealthMonitorWorker struct {
 func newMockHealthMonitorWorker(showdownTime time.Duration) *MockHealthMonitorWorker {
 	return &MockHealthMonitorWorker{
 		shutdown:       atomic.Bool{},
-		showdownTime:   showdownTime,
+		shutdownTime:   showdownTime,
 		healthStatus:   HealthStatusSuccess,
 		statusWatchers: make(map[string]chan HealthStatus),
 		done:           make(chan struct{}),
